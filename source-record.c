@@ -6,6 +6,8 @@
 #include <util/dstr.h>
 #include "version.h"
 #include "obs-websocket-api.h"
+#include "sync-start.h"
+#include "panel-api.h"
 
 #ifndef _WIN32
 #include <dlfcn.h>
@@ -56,6 +58,7 @@ struct source_record_filter_context {
 	bool remove_after_record;
 	long long record_max_seconds;
 	int last_frontend_event;
+	bool sync_start; /* this start belongs to a Record-button batch (sync-start.c) */
 };
 
 DARRAY(obs_source_t *) source_record_filters;
@@ -276,6 +279,16 @@ static void start_file_output_task(void *data)
 			context->output_active = true;
 			obs_source_inc_showing(obs_filter_get_parent(context->source));
 		}
+	}
+	context->starting_file_output = false;
+}
+
+static void sync_started(void *data, bool ok)
+{
+	struct source_record_filter_context *context = data;
+	if (ok && !context->output_active) {
+		context->output_active = true;
+		obs_source_inc_showing(obs_filter_get_parent(context->source));
 	}
 	context->starting_file_output = false;
 }
@@ -566,6 +579,12 @@ static void start_file_output(struct source_record_filter_context *filter, obs_d
 
 	filter->starting_file_output = true;
 
+	if (filter->sync_start) {
+		filter->sync_start = false;
+		sync_start_enqueue(filter->fileOutput, obs_source_get_name(obs_filter_get_parent(filter->source)), path,
+				   sync_started, filter);
+		return;
+	}
 	run_queued(start_file_output_task, filter);
 }
 
@@ -949,8 +968,10 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 
 	if (record != filter->record) {
 		if (record) {
-			if (obs_source_enabled(filter->source) && filter->video_output)
+			if (obs_source_enabled(filter->source) && filter->video_output) {
+				filter->sync_start = record_mode == OUTPUT_MODE_RECORDING;
 				start_file_output(filter, settings);
+			}
 		} else if (filter->fileOutput) {
 			if (filter->closing) {
 				stop_output_sync(filter, filter->fileOutput);
@@ -2597,12 +2618,79 @@ static void websocket_stop_stream(obs_data_t *request_data, obs_data_t *response
 	obs_data_set_bool(response_data, "success", success);
 }
 
+/* ---------- Recording panel accessors (panel-api.h) ---------- */
+
+/* Filters on private sources are skipped: with Studio Mode's scene duplication OBS keeps a
+ * private copy of the program scene, filters included, and those never record (see update). */
+size_t sr_filter_list(obs_source_t ***out)
+{
+	size_t total = source_record_filters.num, n = 0;
+	*out = total ? bmalloc(sizeof(obs_source_t *) * total) : NULL;
+	for (size_t i = 0; i < total; i++) {
+		obs_source_t *filter = source_record_filters.array[i];
+		obs_source_t *parent = obs_filter_get_parent(filter);
+		if (parent && obs_obj_is_private(parent))
+			continue;
+		(*out)[n++] = obs_source_get_ref(filter);
+	}
+	return n;
+}
+
+void sr_filter_list_free(obs_source_t **list, size_t count)
+{
+	for (size_t i = 0; i < count; i++)
+		obs_source_release(list[i]);
+	bfree(list);
+}
+
+obs_output_t *sr_filter_file_output(obs_source_t *filter)
+{
+	struct source_record_filter_context *context = obs_obj_get_data(filter);
+	return context && context->fileOutput ? obs_output_get_ref(context->fileOutput) : NULL;
+}
+
+long long sr_filter_record_mode(obs_source_t *filter)
+{
+	obs_data_t *settings = obs_source_get_settings(filter);
+	long long mode = obs_data_get_int(settings, "record_mode");
+	obs_data_release(settings);
+	return mode;
+}
+
+void sr_filter_set_record_mode(obs_source_t *filter, enum sr_record_mode mode)
+{
+	obs_data_t *settings = obs_data_create();
+	obs_data_set_int(settings, "record_mode", mode);
+	obs_source_update(filter, settings);
+	obs_data_release(settings);
+}
+
+/* How many recordings the Record button is about to start (sync-start.c waits for all of them). */
+static int count_recording_mode_filters(void)
+{
+	int n = 0;
+	for (size_t i = 0; i < source_record_filters.num; i++) {
+		obs_source_t *source = source_record_filters.array[i];
+		struct source_record_filter_context *context = obs_obj_get_data(source);
+		if (!context || context->closing || !obs_source_enabled(source) || !context->video_output ||
+		    !obs_filter_get_parent(source))
+			continue;
+		obs_data_t *settings = obs_source_get_settings(source);
+		if (obs_data_get_int(settings, "record_mode") == OUTPUT_MODE_RECORDING)
+			n++;
+		obs_data_release(settings);
+	}
+	return n;
+}
+
 bool obs_module_load(void)
 {
 	blog(LOG_INFO, "[Source Record] loaded version %s", PROJECT_VERSION);
 	obs_register_source(&source_record_filter_info);
 
 	da_init(source_record_filters);
+	sync_start_init(count_recording_mode_filters);
+	sr_panel_init();
 
 	vendor = obs_websocket_register_vendor("source-record");
 	obs_websocket_vendor_register_request(vendor, "record_start", websocket_start_record, NULL);
@@ -2638,6 +2726,7 @@ void obs_module_post_load(void)
 
 void obs_module_unload(void)
 {
+	sync_start_free();
 	da_free(source_record_filters);
 }
 
