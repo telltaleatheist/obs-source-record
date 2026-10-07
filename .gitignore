@@ -11,3 +11,9 @@
 # ignore generated files
 *.generated.*
 **/.Brewfile.lock.json
+
+# this fork: plugin-template build
+.deps/
+build_*/
+cmake/.CMakeBuildNumber
+version.h
