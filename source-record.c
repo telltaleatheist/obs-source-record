@@ -97,6 +97,19 @@ static bool EncoderAvailable(const char *encoder)
 	return false;
 }
 
+/* A source's audio mix only carries audio on the mix tracks the source is assigned to, so
+ * read it from the first assigned track rather than always track 1 (this fork). A source
+ * kept off track 1 (e.g. a recording-only copy of a mic) would otherwise record silence. */
+static size_t assigned_mix(obs_source_t *source)
+{
+	const uint32_t mixers = obs_source_get_audio_mixers(source);
+	for (size_t i = 0; i < MAX_AUDIO_MIXES; i++) {
+		if (mixers & (1u << i))
+			return i;
+	}
+	return 0;
+}
+
 static void calc_min_ts(obs_source_t *parent, obs_source_t *child, void *param)
 {
 	UNUSED_PARAMETER(parent);
@@ -128,9 +141,10 @@ static void mix_audio(obs_source_t *parent, obs_source_t *child, void *param)
 
 	struct obs_source_audio_mix child_audio;
 	obs_source_get_audio_mix(child, &child_audio);
+	const size_t mix = assigned_mix(child);
 	for (size_t ch = 0; ch < (size_t)mixed_audio->speakers; ch++) {
 		float *out = ((float *)mixed_audio->data[ch]) + pos;
-		float *in = child_audio.output[0].data[ch];
+		float *in = child_audio.output[mix].data[ch];
 		if (!in)
 			continue;
 		for (size_t i = 0; i < count; i++) {
@@ -227,6 +241,7 @@ static bool audio_input_callback(void *param, uint64_t start_ts_in, uint64_t end
 
 	struct obs_source_audio_mix audio;
 	obs_source_get_audio_mix(audio_source, &audio);
+	const size_t source_mix = assigned_mix(audio_source);
 
 	const size_t channels = audio_output_get_channels(filter->audio_output);
 	for (size_t mix_idx = 0; mix_idx < MAX_AUDIO_MIXES; mix_idx++) {
@@ -234,7 +249,7 @@ static bool audio_input_callback(void *param, uint64_t start_ts_in, uint64_t end
 			continue;
 		for (size_t ch = 0; ch < channels; ch++) {
 			float *out = mixes[mix_idx].data[ch];
-			float *in = audio.output[0].data[ch];
+			float *in = audio.output[source_mix].data[ch];
 			if (!in)
 				continue;
 			for (size_t i = 0; i < AUDIO_OUTPUT_FRAMES; i++) {

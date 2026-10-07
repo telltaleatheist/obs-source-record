@@ -8,6 +8,7 @@
 
 #include <obs-frontend-api.h>
 #include <obs-module.h>
+#include <util/config-file.h>
 
 #include <QCheckBox>
 #include <QGridLayout>
@@ -15,6 +16,10 @@
 #include <QMessageBox>
 #include <QPushButton>
 #include <QScrollArea>
+#include <QToolButton>
+#include <QStringList>
+
+#include <cstring>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QWidget>
@@ -48,7 +53,69 @@ bool Confirm(QWidget *parent, const char *text)
 				     QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes;
 }
 
+// What audio goes into a Source Record file, from the filter's settings.
+QString FilterAudio(obs_source_t *filter)
+{
+	obs_data_t *settings = obs_source_get_settings(filter);
+	QString text;
+	if (!obs_data_get_bool(settings, "different_audio")) {
+		obs_source_t *parent = obs_filter_get_parent(filter);
+		text = QString(obs_module_text("Panel.AudioOwn")).arg(QString::fromUtf8(parent ? obs_source_get_name(parent) : "?"));
+	} else {
+		long long track = obs_data_get_int(settings, "audio_track");
+		if (track == -1)
+			text = obs_module_text("Panel.AudioAllTracks");
+		else if (track > 0)
+			text = QString(obs_module_text("Panel.AudioTrack")).arg(track);
+		else
+			text = QString::fromUtf8(obs_data_get_string(settings, "audio_source"));
+	}
+	obs_data_release(settings);
+	return text;
+}
+
+// The main recording's audio tracks and which inputs feed each.
+QString MainAudio()
+{
+	config_t *cfg = obs_frontend_get_profile_config();
+	if (!cfg)
+		return QString();
+	bool advanced = strcmp(config_get_string(cfg, "Output", "Mode") ? config_get_string(cfg, "Output", "Mode") : "",
+			       "Advanced") == 0;
+	long long mask = advanced ? config_get_int(cfg, "AdvOut", "RecTracks") : 1;
+	struct Ctx {
+		uint32_t track;
+		QStringList names;
+	};
+	QStringList lines;
+	for (uint32_t t = 0; t < MAX_AUDIO_MIXES; t++) {
+		if (!(mask & (1ll << t)))
+			continue;
+		Ctx ctx{t, {}};
+		obs_enum_sources(
+			[](void *data, obs_source_t *source) {
+				auto c = static_cast<Ctx *>(data);
+				if ((obs_source_get_output_flags(source) & OBS_SOURCE_AUDIO) && !obs_source_muted(source) &&
+				    (obs_source_get_audio_mixers(source) & (1u << c->track)))
+					c->names << QString::fromUtf8(obs_source_get_name(source));
+				return true;
+			},
+			&ctx);
+		QString trackName;
+		if (advanced) {
+			const char *n = config_get_string(cfg, "AdvOut", QString("Track%1Name").arg(t + 1).toUtf8().constData());
+			if (n && *n)
+				trackName = QString::fromUtf8(n);
+		}
+		lines << QString(obs_module_text("Panel.MainTrack")).arg(t + 1).arg(trackName.isEmpty() ? QString() : " (" + trackName + ")")
+				 .arg(ctx.names.isEmpty() ? obs_module_text("Panel.AudioNothing") : ctx.names.join(", "));
+	}
+	return lines.join(QChar('\n'));
+}
+
 struct Row {
+	QToolButton *expand;
+	QLabel *audio; // the expanded line: what audio goes into this file
 	QCheckBox *armed;
 	QLabel *dot;
 	QLabel *name;
@@ -79,7 +146,7 @@ public:
 		auto body = new QWidget(scroll);
 		grid_ = new QGridLayout(body);
 		grid_->setAlignment(Qt::AlignTop);
-		grid_->setColumnStretch(2, 1);
+		grid_->setColumnStretch(3, 1);
 		scroll->setWidget(body);
 		outer->addWidget(scroll, 1);
 
@@ -130,7 +197,30 @@ private:
 	Row AddRow(const QString &name, bool withButton)
 	{
 		Row r{};
-		int y = nextRow_++;
+		int y = nextRow_;
+		nextRow_ += 2; // the second row is the expandable audio line
+		// A labelled disclosure toggle ("Audio ▸" / "Audio ▾"), clearer than a bare arrow.
+		r.expand = new QToolButton(this);
+		r.expand->setAutoRaise(true);
+		r.expand->setCheckable(true);
+		r.expand->setToolTip(obs_module_text("Panel.AudioTip"));
+		r.expand->setText(QString::fromUtf8(obs_module_text("Panel.AudioCollapsed")));
+		r.audio = new QLabel(this);
+		r.audio->setWordWrap(true);
+		r.audio->setTextInteractionFlags(Qt::TextSelectableByMouse);
+		// Secondary text in the theme's own text colour, slightly dimmed, so it reads on any theme.
+		QPalette pal = r.audio->palette();
+		QColor text = pal.color(QPalette::WindowText);
+		text.setAlpha(190);
+		pal.setColor(QPalette::WindowText, text);
+		r.audio->setPalette(pal);
+		r.audio->setVisible(false);
+		QLabel *audio = r.audio;
+		QToolButton *expand = r.expand;
+		QObject::connect(r.expand, &QToolButton::toggled, [audio, expand](bool open) {
+			audio->setVisible(open);
+			expand->setText(QString::fromUtf8(obs_module_text(open ? "Panel.AudioExpanded" : "Panel.AudioCollapsed")));
+		});
 		r.armed = new QCheckBox(this);
 		r.armed->setToolTip(obs_module_text("Panel.ArmedTip"));
 		r.dot = new QLabel(this);
@@ -138,15 +228,17 @@ private:
 		r.time = new QLabel(this);
 		r.size = new QLabel(this);
 		r.dropped = new QLabel(this);
-		grid_->addWidget(r.armed, y, 0);
-		grid_->addWidget(r.dot, y, 1);
-		grid_->addWidget(r.name, y, 2);
-		grid_->addWidget(r.time, y, 3);
-		grid_->addWidget(r.size, y, 4);
-		grid_->addWidget(r.dropped, y, 5);
+		grid_->addWidget(r.expand, y, 0);
+		grid_->addWidget(r.armed, y, 1);
+		grid_->addWidget(r.dot, y, 2);
+		grid_->addWidget(r.name, y, 3);
+		grid_->addWidget(r.time, y, 4);
+		grid_->addWidget(r.size, y, 5);
+		grid_->addWidget(r.dropped, y, 6);
+		grid_->addWidget(r.audio, y + 1, 3, 1, 5);
 		if (withButton) {
 			r.button = new QPushButton(this);
-			grid_->addWidget(r.button, y, 6);
+			grid_->addWidget(r.button, y, 7);
 		}
 		return r;
 	}
@@ -154,15 +246,16 @@ private:
 	void ClearSourceRows()
 	{
 		for (auto &[key, r] : rows_) {
-			for (QWidget *w : {(QWidget *)r.armed, (QWidget *)r.dot, (QWidget *)r.name, (QWidget *)r.time,
-					   (QWidget *)r.size, (QWidget *)r.dropped, (QWidget *)r.button})
+			for (QWidget *w : {(QWidget *)r.expand, (QWidget *)r.audio, (QWidget *)r.armed, (QWidget *)r.dot,
+					   (QWidget *)r.name, (QWidget *)r.time, (QWidget *)r.size, (QWidget *)r.dropped,
+					   (QWidget *)r.button})
 				if (w) {
 					grid_->removeWidget(w);
 					w->deleteLater();
 				}
 		}
 		rows_.clear();
-		nextRow_ = 1; // row 0 is the main recording
+		nextRow_ = 2; // rows 0-1 are the main recording
 	}
 
 	static void ShowStatus(Row &r, obs_output_t *out)
@@ -235,11 +328,15 @@ private:
 			r.armed->blockSignals(false);
 			r.armed->setEnabled(!active);
 			r.button->setText(obs_module_text(active ? "Panel.Stop" : "Panel.Start"));
+			if (r.audio->isVisible())
+				r.audio->setText(QString(obs_module_text("Panel.AudioLine")).arg(FilterAudio(list[i])));
 			ShowStatus(r, out);
 			obs_output_release(out);
 		}
 		sr_filter_list_free(list, count);
 
+		if (mainRow_.audio->isVisible())
+			mainRow_.audio->setText(MainAudio());
 		obs_output_t *main = obs_frontend_get_recording_output();
 		ShowStatus(mainRow_, main);
 		obs_output_release(main);
